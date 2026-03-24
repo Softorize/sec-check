@@ -6,13 +6,6 @@ from urllib.error import HTTPError
 
 
 @pytest.fixture
-def mock_http_get():
-    """Patch _http_get_json to return controlled data."""
-    with patch("sec_check.checkers._http_get_json") as m:
-        yield m
-
-
-@pytest.fixture
 def mock_http_post():
     """Patch _http_post_json to return controlled data."""
     with patch("sec_check.checkers._http_post_json") as m:
@@ -27,14 +20,12 @@ def mock_fetch_with_status():
 
 
 @pytest.fixture
-def no_network(mock_http_get, mock_http_post, mock_fetch_with_status):
+def no_network(mock_http_post, mock_fetch_with_status):
     """Block all network access — all HTTP helpers return None/error."""
     from sec_check.checkers import FetchResult
-    mock_http_get.return_value = None
     mock_http_post.return_value = None
     mock_fetch_with_status.return_value = FetchResult(data=None, status_code=None, error="blocked by test")
     return {
-        "get": mock_http_get,
         "post": mock_http_post,
         "fetch": mock_fetch_with_status,
     }

@@ -1,7 +1,7 @@
 """Tests for sec_check.parsers — command parsing and bypass prevention."""
 
 import pytest
-from sec_check.parsers import parse_command, PackageRef
+from sec_check.parsers import parse_command, PackageRef, DYNAMIC_INSTALL, PIPED_INSTALL
 
 
 class TestPipParsing:
@@ -161,19 +161,19 @@ class TestBypassPrevention:
     def test_command_substitution_dollar(self):
         pkgs = parse_command("pip install $(echo malicious)")
         assert len(pkgs) == 1
-        assert pkgs[0].name == "__DYNAMIC_INSTALL__"
+        assert pkgs[0].name == DYNAMIC_INSTALL
 
     def test_command_substitution_backtick(self):
         pkgs = parse_command("pip install `echo malicious`")
         assert len(pkgs) == 1
-        assert pkgs[0].name == "__DYNAMIC_INSTALL__"
+        assert pkgs[0].name == DYNAMIC_INSTALL
 
     def test_pipe_to_install(self):
         pkgs = parse_command("echo pkg | xargs pip install foo")
         # Should get 'foo' from direct parsing + piped install marker
         names = [p.name for p in pkgs]
         assert "foo" in names
-        assert "__PIPED_INSTALL__" in names
+        assert PIPED_INSTALL in names
 
     def test_sudo_with_env_and_path(self):
         pkgs = parse_command("sudo -E /usr/local/bin/pip3 install flask")

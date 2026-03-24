@@ -6,6 +6,7 @@ Reduces API calls across hook invocations.
 import hashlib
 import json
 import os
+import random
 import time
 from typing import Optional
 
@@ -53,6 +54,11 @@ class DiskCache:
                 json.dump({"ts": time.time(), "data": data}, f)
         except OSError:
             pass  # Cache write failure is non-fatal
+
+    def maybe_cleanup(self, probability: float = 0.05) -> None:
+        """Run cleanup ~5% of the time to avoid I/O on every invocation."""
+        if random.random() < probability:
+            self.cleanup()
 
     def cleanup(self) -> None:
         """Remove expired cache entries."""

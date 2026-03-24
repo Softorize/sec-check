@@ -47,7 +47,7 @@ _SEVERITY_ICONS = {
 }
 
 
-def format_report(findings: list[Finding], packages: list) -> str:
+def format_report(findings: list[Finding]) -> str:
     """Format findings into a readable report for stderr."""
     lines = []
     lines.append("")
@@ -104,11 +104,11 @@ def format_report(findings: list[Finding], packages: list) -> str:
 
 
 def main():
-    # Optional: run disk cache cleanup
+    # Optional: initialize disk cache
     try:
         from sec_check.cache import DiskCache
-        DiskCache().cleanup()
         disk_cache = DiskCache()
+        disk_cache.maybe_cleanup()
     except ImportError:
         disk_cache = None
     except Exception:
@@ -190,7 +190,7 @@ def main():
     severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
     all_findings.sort(key=lambda f: severity_order.get(f.severity, 5))
 
-    report = format_report(all_findings, packages)
+    report = format_report(all_findings)
 
     # Decide: block or warn
     has_blocking = any(f.should_block for f in all_findings)
