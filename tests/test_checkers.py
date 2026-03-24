@@ -5,6 +5,7 @@ from unittest.mock import patch
 from sec_check.parsers import PackageRef
 from sec_check.checkers import (
     MetadataCache, FetchResult, CheckResult,
+    DYNAMIC_INSTALL, PIPED_INSTALL,
     check_suspicious_install,
     check_known_vulnerabilities,
     check_typosquatting,
@@ -45,14 +46,14 @@ def _empty_cache():
 
 class TestCheckSuspiciousInstall:
     def test_dynamic_install(self):
-        pkg = PackageRef("__DYNAMIC_INSTALL__", None, "pypi", "pip install $(echo x)")
+        pkg = PackageRef(DYNAMIC_INSTALL, None, "pypi", "pip install $(echo x)")
         findings = check_suspicious_install(pkg, _empty_cache())
         assert len(findings) == 1
         assert findings[0].severity == "high"
         assert findings[0].check_name == "dynamic_install"
 
     def test_piped_install(self):
-        pkg = PackageRef("__PIPED_INSTALL__", None, "npm", "echo x | npm install")
+        pkg = PackageRef(PIPED_INSTALL, None, "npm", "echo x | npm install")
         findings = check_suspicious_install(pkg, _empty_cache())
         assert len(findings) == 1
         assert findings[0].severity == "high"
@@ -368,7 +369,7 @@ class TestCheckPackageExists:
 class TestRunAllChecks:
     def test_synthetic_short_circuits(self):
         """Synthetic packages should only run check_suspicious_install."""
-        pkg = PackageRef("__DYNAMIC_INSTALL__", None, "pypi", "pip install $(x)")
+        pkg = PackageRef(DYNAMIC_INSTALL, None, "pypi", "pip install $(x)")
         result = run_all_checks(pkg)
         assert isinstance(result, CheckResult)
         assert result.total_checkers == 1

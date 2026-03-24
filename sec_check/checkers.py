@@ -15,6 +15,18 @@ from difflib import SequenceMatcher
 
 from .parsers import PackageRef
 
+# ─── Constants ───────────────────────────────────────────────────────────────
+
+DYNAMIC_INSTALL = "__DYNAMIC_INSTALL__"
+PIPED_INSTALL = "__PIPED_INSTALL__"
+
+_SSL_CONTEXT = ssl.create_default_context()
+_USER_AGENT = "sec-check/1.0"
+
+_REGISTRY_URLS = {
+    "pypi": "https://pypi.org/pypi/{name}/json",
+    "npm": "https://registry.npmjs.org/{name}",
+}
 
 # ─── Data structures ─────────────────────────────────────────────────────────
 
@@ -58,74 +70,51 @@ class MetadataCache:
 
     def __init__(self, disk_cache=None):
         self._store: dict[str, FetchResult] = {}
-        self._disk = disk_cache  # Optional DiskCache instance
+        self._disk = disk_cache
+
+    def _get(self, ecosystem: str, name: str) -> FetchResult:
+        key = f"{ecosystem}:{name}"
+        if key in self._store:
+            return self._store[key]
+
+        if self._disk:
+            cached = self._disk.get(key)
+            if cached is not None:
+                result = FetchResult(data=cached, status_code=200)
+                self._store[key] = result
+                return result
+
+        url_template = _REGISTRY_URLS.get(ecosystem)
+        if not url_template:
+            return FetchResult(data=None, status_code=None, error=f"unknown ecosystem: {ecosystem}")
+
+        result = _fetch_with_status(url_template.format(name=name))
+        self._store[key] = result
+
+        if self._disk and result.data:
+            self._disk.set(key, result.data)
+
+        return result
 
     def get_pypi(self, name: str) -> FetchResult:
-        key = f"pypi:{name}"
-        if key in self._store:
-            return self._store[key]
-
-        # Check disk cache
-        if self._disk:
-            cached = self._disk.get(key)
-            if cached is not None:
-                result = FetchResult(data=cached, status_code=200)
-                self._store[key] = result
-                return result
-
-        result = _fetch_with_status(f"https://pypi.org/pypi/{name}/json")
-        self._store[key] = result
-
-        if self._disk and result.data:
-            self._disk.set(key, result.data)
-
-        return result
+        return self._get("pypi", name)
 
     def get_npm(self, name: str) -> FetchResult:
-        key = f"npm:{name}"
-        if key in self._store:
-            return self._store[key]
-
-        if self._disk:
-            cached = self._disk.get(key)
-            if cached is not None:
-                result = FetchResult(data=cached, status_code=200)
-                self._store[key] = result
-                return result
-
-        result = _fetch_with_status(f"https://registry.npmjs.org/{name}")
-        self._store[key] = result
-
-        if self._disk and result.data:
-            self._disk.set(key, result.data)
-
-        return result
+        return self._get("npm", name)
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
-def _http_get_json(url: str, timeout: int = 10) -> Optional[dict]:
-    """Fetch JSON from a URL. Returns None on any failure."""
-    try:
-        ctx = ssl.create_default_context()
-        req = urllib.request.Request(url, headers={"User-Agent": "sec-check/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            return json.loads(resp.read())
-    except Exception:
-        return None
-
-
 def _http_post_json(url: str, body: dict, timeout: int = 10) -> Optional[dict]:
     """POST JSON to a URL. Returns None on any failure."""
     try:
-        ctx = ssl.create_default_context()
         data = json.dumps(body).encode()
         req = urllib.request.Request(
             url, data=data,
-            headers={"User-Agent": "sec-check/1.0", "Content-Type": "application/json"},
+            headers={"User-Agent": _USER_AGENT, "Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
             return json.loads(resp.read())
     except Exception:
         return None
@@ -134,9 +123,8 @@ def _http_post_json(url: str, body: dict, timeout: int = 10) -> Optional[dict]:
 def _fetch_with_status(url: str, timeout: int = 10) -> FetchResult:
     """Fetch JSON from a URL, returning status code for error differentiation."""
     try:
-        ctx = ssl.create_default_context()
-        req = urllib.request.Request(url, headers={"User-Agent": "sec-check/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+        with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CONTEXT) as resp:
             data = json.loads(resp.read())
             return FetchResult(data=data, status_code=200)
     except urllib.error.HTTPError as e:
@@ -164,7 +152,7 @@ def _resolve_latest_version(pkg: PackageRef, cache: MetadataCache) -> Optional[s
 
 def check_suspicious_install(pkg: PackageRef, cache: MetadataCache) -> list[Finding]:
     """Flag installs where we can't determine the package name."""
-    if pkg.name == "__DYNAMIC_INSTALL__":
+    if pkg.name == DYNAMIC_INSTALL:
         return [Finding(
             severity="high",
             check_name="dynamic_install",
@@ -178,7 +166,7 @@ def check_suspicious_install(pkg: PackageRef, cache: MetadataCache) -> list[Find
             package="<dynamic>",
             ecosystem=pkg.ecosystem,
         )]
-    if pkg.name == "__PIPED_INSTALL__":
+    if pkg.name == PIPED_INSTALL:
         return [Finding(
             severity="high",
             check_name="piped_install",
@@ -758,7 +746,7 @@ def run_all_checks(pkg: PackageRef, disk_cache=None) -> CheckResult:
     errors = []
 
     # Short-circuit for synthetic package names (dynamic/piped installs)
-    if pkg.name.startswith("__") and pkg.name.endswith("__"):
+    if pkg.name in (DYNAMIC_INSTALL, PIPED_INSTALL):
         try:
             findings.extend(check_suspicious_install(pkg, cache))
         except Exception as e:

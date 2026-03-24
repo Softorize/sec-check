@@ -10,6 +10,10 @@ import shlex
 from dataclasses import dataclass
 from typing import Optional
 
+# Synthetic package names for installs we can't inspect
+DYNAMIC_INSTALL = "__DYNAMIC_INSTALL__"
+PIPED_INSTALL = "__PIPED_INSTALL__"
+
 
 @dataclass
 class PackageRef:
@@ -382,7 +386,7 @@ def parse_command(command: str) -> list[PackageRef]:
                 m = pattern.match(cleaned)
                 if m:
                     all_packages.append(PackageRef(
-                        name="__DYNAMIC_INSTALL__",
+                        name=DYNAMIC_INSTALL,
                         version=None,
                         ecosystem=ecosystem,
                         raw=sub,
@@ -411,7 +415,7 @@ def parse_command(command: str) -> list[PackageRef]:
                 # (they'd come from the pipe)
                 if pattern.match(next_normalized) or _is_install_base(next_normalized, ecosystem):
                     all_packages.append(PackageRef(
-                        name="__PIPED_INSTALL__",
+                        name=PIPED_INSTALL,
                         version=None,
                         ecosystem=ecosystem,
                         raw=f"{sub} | {next_sub}",
