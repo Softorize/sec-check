@@ -1,0 +1,13 @@
+[project]
+name = "sec-check"
+version = "0.1.0"
+requires-python = ">=3.8"
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: marks tests as integration tests requiring network (deselect with '-m \"not integration\"')",
+]

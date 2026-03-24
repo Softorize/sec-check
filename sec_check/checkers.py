@@ -34,6 +34,74 @@ class Finding:
         return self.severity in ("critical", "high")
 
 
+@dataclass
+class FetchResult:
+    """Result of an HTTP fetch, distinguishing success/404/error."""
+    data: Optional[dict] = None
+    status_code: Optional[int] = None  # 200=success, 404=not found, None=error
+    error: Optional[str] = None
+
+
+@dataclass
+class CheckResult:
+    """Aggregated result from run_all_checks."""
+    findings: list[Finding]
+    total_checkers: int
+    failed_checkers: int
+    checker_errors: list[str] = field(default_factory=list)
+
+
+# ─── Metadata Cache ──────────────────────────────────────────────────────────
+
+class MetadataCache:
+    """In-memory cache for registry metadata within a single check run."""
+
+    def __init__(self, disk_cache=None):
+        self._store: dict[str, FetchResult] = {}
+        self._disk = disk_cache  # Optional DiskCache instance
+
+    def get_pypi(self, name: str) -> FetchResult:
+        key = f"pypi:{name}"
+        if key in self._store:
+            return self._store[key]
+
+        # Check disk cache
+        if self._disk:
+            cached = self._disk.get(key)
+            if cached is not None:
+                result = FetchResult(data=cached, status_code=200)
+                self._store[key] = result
+                return result
+
+        result = _fetch_with_status(f"https://pypi.org/pypi/{name}/json")
+        self._store[key] = result
+
+        if self._disk and result.data:
+            self._disk.set(key, result.data)
+
+        return result
+
+    def get_npm(self, name: str) -> FetchResult:
+        key = f"npm:{name}"
+        if key in self._store:
+            return self._store[key]
+
+        if self._disk:
+            cached = self._disk.get(key)
+            if cached is not None:
+                result = FetchResult(data=cached, status_code=200)
+                self._store[key] = result
+                return result
+
+        result = _fetch_with_status(f"https://registry.npmjs.org/{name}")
+        self._store[key] = result
+
+        if self._disk and result.data:
+            self._disk.set(key, result.data)
+
+        return result
+
+
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def _http_get_json(url: str, timeout: int = 10) -> Optional[dict]:
@@ -63,6 +131,69 @@ def _http_post_json(url: str, body: dict, timeout: int = 10) -> Optional[dict]:
         return None
 
 
+def _fetch_with_status(url: str, timeout: int = 10) -> FetchResult:
+    """Fetch JSON from a URL, returning status code for error differentiation."""
+    try:
+        ctx = ssl.create_default_context()
+        req = urllib.request.Request(url, headers={"User-Agent": "sec-check/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            data = json.loads(resp.read())
+            return FetchResult(data=data, status_code=200)
+    except urllib.error.HTTPError as e:
+        return FetchResult(data=None, status_code=e.code, error=str(e))
+    except Exception as e:
+        return FetchResult(data=None, status_code=None, error=str(e))
+
+
+# ─── Version resolution ─────────────────────────────────────────────────────
+
+def _resolve_latest_version(pkg: PackageRef, cache: MetadataCache) -> Optional[str]:
+    """Resolve the latest version of a package from registry metadata."""
+    if pkg.ecosystem == "pypi":
+        result = cache.get_pypi(pkg.name)
+        if result.data:
+            return result.data.get("info", {}).get("version")
+    elif pkg.ecosystem == "npm":
+        result = cache.get_npm(pkg.name)
+        if result.data:
+            return result.data.get("dist-tags", {}).get("latest")
+    return None
+
+
+# ─── 0. Suspicious Install Check ────────────────────────────────────────────
+
+def check_suspicious_install(pkg: PackageRef, cache: MetadataCache) -> list[Finding]:
+    """Flag installs where we can't determine the package name."""
+    if pkg.name == "__DYNAMIC_INSTALL__":
+        return [Finding(
+            severity="high",
+            check_name="dynamic_install",
+            title="Install command uses dynamic/computed package name",
+            detail=(
+                f"The install command uses shell substitution ($() or backticks) "
+                f"to compute the package name dynamically: {pkg.raw}\n\n"
+                f"sec-check cannot verify the safety of dynamically-computed package names. "
+                f"This pattern is suspicious and commonly used in supply-chain attacks."
+            ),
+            package="<dynamic>",
+            ecosystem=pkg.ecosystem,
+        )]
+    if pkg.name == "__PIPED_INSTALL__":
+        return [Finding(
+            severity="high",
+            check_name="piped_install",
+            title="Package install receives input via pipe",
+            detail=(
+                f"The install command receives package names from a pipe: {pkg.raw}\n\n"
+                f"sec-check cannot verify packages passed through pipes. "
+                f"Review the full command carefully before allowing."
+            ),
+            package="<piped>",
+            ecosystem=pkg.ecosystem,
+        )]
+    return []
+
+
 # ─── 1. Known Vulnerability Check (OSV.dev) ─────────────────────────────────
 
 _OSV_ECOSYSTEM_MAP = {
@@ -74,7 +205,7 @@ _OSV_ECOSYSTEM_MAP = {
 }
 
 
-def check_known_vulnerabilities(pkg: PackageRef) -> list[Finding]:
+def check_known_vulnerabilities(pkg: PackageRef, cache: MetadataCache) -> list[Finding]:
     """Query OSV.dev for known vulnerabilities."""
     findings = []
     osv_eco = _OSV_ECOSYSTEM_MAP.get(pkg.ecosystem)
@@ -82,8 +213,26 @@ def check_known_vulnerabilities(pkg: PackageRef) -> list[Finding]:
         return findings
 
     body: dict = {"package": {"name": pkg.name, "ecosystem": osv_eco}}
-    if pkg.version:
-        body["version"] = pkg.version
+
+    version_to_check = pkg.version
+    resolved_version = None
+
+    if not version_to_check:
+        # Resolve latest version from registry to avoid returning all historical CVEs
+        resolved_version = _resolve_latest_version(pkg, cache)
+        if resolved_version:
+            version_to_check = resolved_version
+            findings.append(Finding(
+                severity="info",
+                check_name="version_resolved",
+                title=f"No version specified; checked against latest ({resolved_version})",
+                detail=f"No version was specified in the install command. Checking against the latest version ({resolved_version}) from the registry.",
+                package=pkg.name,
+                ecosystem=pkg.ecosystem,
+            ))
+
+    if version_to_check:
+        body["version"] = version_to_check
 
     data = _http_post_json("https://api.osv.dev/v1/query", body)
     if not data or "vulns" not in data:
@@ -107,8 +256,12 @@ def check_known_vulnerabilities(pkg: PackageRef) -> list[Finding]:
             sev = "high"
         elif cvss_score and cvss_score >= 4.0:
             sev = "medium"
+        elif cvss_score is not None:
+            sev = "low"
         else:
-            sev = "high"  # default to high for unknown-severity vulns
+            # No CVSS score available — default to medium (non-blocking)
+            # to avoid false-positive blocking of popular packages
+            sev = "medium"
 
         refs = [r.get("url", "") for r in vuln.get("references", []) if r.get("url")]
 
@@ -179,7 +332,7 @@ def _similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 
-def check_typosquatting(pkg: PackageRef) -> list[Finding]:
+def check_typosquatting(pkg: PackageRef, cache: MetadataCache) -> list[Finding]:
     """Check if the package name looks like a typosquat of a popular package."""
     findings = []
     popular = _POPULAR_PACKAGES.get(pkg.ecosystem, [])
@@ -220,7 +373,7 @@ def check_typosquatting(pkg: PackageRef) -> list[Finding]:
                             title=f"Likely typosquat of '{legit}'",
                             detail=(
                                 f"Package '{pkg.name}' matches a known typosquatting "
-                                f"pattern ('{char}' → '{repl}') of popular package "
+                                f"pattern ('{char}' -> '{repl}') of popular package "
                                 f"'{legit}'.\n\nDid you mean: {legit}?"
                             ),
                             package=pkg.name,
@@ -233,15 +386,7 @@ def check_typosquatting(pkg: PackageRef) -> list[Finding]:
 
 # ─── 3. Package Metadata Analysis ───────────────────────────────────────────
 
-def _get_pypi_metadata(name: str) -> Optional[dict]:
-    return _http_get_json(f"https://pypi.org/pypi/{name}/json")
-
-
-def _get_npm_metadata(name: str) -> Optional[dict]:
-    return _http_get_json(f"https://registry.npmjs.org/{name}")
-
-
-def check_package_metadata(pkg: PackageRef) -> list[Finding]:
+def check_package_metadata(pkg: PackageRef, cache: MetadataCache) -> list[Finding]:
     """
     Analyze package registry metadata for red flags:
     - Very new package with few downloads
@@ -252,28 +397,30 @@ def check_package_metadata(pkg: PackageRef) -> list[Finding]:
     findings = []
 
     if pkg.ecosystem == "pypi":
-        findings.extend(_check_pypi_metadata(pkg))
+        findings.extend(_check_pypi_metadata(pkg, cache))
     elif pkg.ecosystem == "npm":
-        findings.extend(_check_npm_metadata(pkg))
-    # Other ecosystems can be added similarly
+        findings.extend(_check_npm_metadata(pkg, cache))
 
     return findings
 
 
-def _check_pypi_metadata(pkg: PackageRef) -> list[Finding]:
+def _check_pypi_metadata(pkg: PackageRef, cache: MetadataCache) -> list[Finding]:
     findings = []
-    data = _get_pypi_metadata(pkg.name)
-    if not data:
-        findings.append(Finding(
-            severity="medium",
-            check_name="metadata_unavailable",
-            title=f"Cannot fetch metadata for '{pkg.name}'",
-            detail="Could not retrieve package metadata from PyPI. The package may not exist, may have been removed, or PyPI may be unreachable.",
-            package=pkg.name,
-            ecosystem="pypi",
-        ))
+    result = cache.get_pypi(pkg.name)
+
+    if not result.data:
+        if result.status_code != 404:  # 404 is handled by check_package_exists
+            findings.append(Finding(
+                severity="medium",
+                check_name="metadata_unavailable",
+                title=f"Cannot fetch metadata for '{pkg.name}'",
+                detail="Could not retrieve package metadata from PyPI. The package may not exist, may have been removed, or PyPI may be unreachable.",
+                package=pkg.name,
+                ecosystem="pypi",
+            ))
         return findings
 
+    data = result.data
     info = data.get("info", {})
     releases = data.get("releases", {})
 
@@ -361,23 +508,43 @@ def _check_pypi_metadata(pkg: PackageRef) -> list[Finding]:
             ecosystem="pypi",
         ))
 
+    # Check 5: URL-based dependencies in requires_dist (supply-chain vector)
+    requires_dist = info.get("requires_dist") or []
+    for req in requires_dist:
+        if isinstance(req, str) and "@" in req and ("http://" in req or "https://" in req):
+            findings.append(Finding(
+                severity="high",
+                check_name="url_dependency",
+                title=f"URL-based dependency: {req[:80]}",
+                detail=(
+                    f"'{pkg.name}' has a dependency that points to a URL: {req}\n\n"
+                    f"URL-based dependencies can be used to inject malicious packages "
+                    f"from arbitrary sources."
+                ),
+                package=pkg.name,
+                ecosystem="pypi",
+            ))
+
     return findings
 
 
-def _check_npm_metadata(pkg: PackageRef) -> list[Finding]:
+def _check_npm_metadata(pkg: PackageRef, cache: MetadataCache) -> list[Finding]:
     findings = []
-    data = _get_npm_metadata(pkg.name)
-    if not data:
-        findings.append(Finding(
-            severity="medium",
-            check_name="metadata_unavailable",
-            title=f"Cannot fetch metadata for '{pkg.name}'",
-            detail="Could not retrieve package metadata from npm registry.",
-            package=pkg.name,
-            ecosystem="npm",
-        ))
+    result = cache.get_npm(pkg.name)
+
+    if not result.data:
+        if result.status_code != 404:
+            findings.append(Finding(
+                severity="medium",
+                check_name="metadata_unavailable",
+                title=f"Cannot fetch metadata for '{pkg.name}'",
+                detail="Could not retrieve package metadata from npm registry.",
+                package=pkg.name,
+                ecosystem="npm",
+            ))
         return findings
 
+    data = result.data
     time_data = data.get("time", {})
     created_str = time_data.get("created")
     modified_str = time_data.get("modified")
@@ -448,24 +615,23 @@ _SUSPICIOUS_PATTERNS = [
 ]
 
 
-def check_install_scripts(pkg: PackageRef) -> list[Finding]:
+def check_install_scripts(pkg: PackageRef, cache: MetadataCache) -> list[Finding]:
     """
-    For PyPI packages, fetch the latest sdist/wheel and scan setup.py / setup.cfg
-    for suspicious patterns. This is a lightweight heuristic check.
-
-    Note: This only checks the metadata description for now (to avoid downloading
-    full packages in a hook). A more thorough version could download and inspect.
+    Check for suspicious patterns in package metadata and install scripts.
+    - PyPI: scan description, check sdist size
+    - npm: scan preinstall/postinstall scripts
     """
     findings = []
 
     if pkg.ecosystem == "pypi":
-        data = _get_pypi_metadata(pkg.name)
-        if not data:
+        result = cache.get_pypi(pkg.name)
+        if not result.data:
             return findings
 
+        data = result.data
         description = data.get("info", {}).get("description", "") or ""
 
-        # Some malicious packages embed code in the long description
+        # Scan description for suspicious patterns
         for pattern, desc in _SUSPICIOUS_PATTERNS:
             if pattern.search(description):
                 findings.append(Finding(
@@ -477,60 +643,97 @@ def check_install_scripts(pkg: PackageRef) -> list[Finding]:
                     ecosystem="pypi",
                 ))
 
+        # Check for suspiciously small sdist
+        urls = data.get("urls", [])
+        sdists = [u for u in urls if u.get("packagetype") == "sdist"]
+        if sdists:
+            size = sdists[0].get("size", 0)
+            if 0 < size < 1000:
+                findings.append(Finding(
+                    severity="medium",
+                    check_name="tiny_sdist",
+                    title=f"Suspiciously small source distribution ({size} bytes)",
+                    detail=(
+                        f"'{pkg.name}' has an sdist of only {size} bytes. "
+                        f"Legitimate packages are typically larger. Very small packages "
+                        f"may be malicious placeholders."
+                    ),
+                    package=pkg.name,
+                    ecosystem="pypi",
+                ))
+
+    elif pkg.ecosystem == "npm":
+        result = cache.get_npm(pkg.name)
+        if not result.data:
+            return findings
+
+        data = result.data
+        latest_tag = data.get("dist-tags", {}).get("latest")
+        if latest_tag:
+            latest_data = data.get("versions", {}).get(latest_tag, {})
+            scripts = latest_data.get("scripts", {})
+            for hook_name in ("preinstall", "install", "postinstall"):
+                if hook_name in scripts:
+                    script_content = scripts[hook_name]
+                    findings.append(Finding(
+                        severity="medium",
+                        check_name="install_script",
+                        title=f"npm {hook_name} script detected",
+                        detail=f"'{pkg.name}' has a '{hook_name}' script: {str(script_content)[:200]}",
+                        package=pkg.name,
+                        ecosystem="npm",
+                    ))
+                    # Also scan script content against suspicious patterns
+                    for pattern, desc in _SUSPICIOUS_PATTERNS:
+                        if isinstance(script_content, str) and pattern.search(script_content):
+                            findings.append(Finding(
+                                severity="high",
+                                check_name="suspicious_install_script",
+                                title=f"Suspicious pattern in npm {hook_name}: {desc}",
+                                detail=(
+                                    f"The '{hook_name}' script contains '{desc}'. "
+                                    f"This is a common supply-chain attack vector."
+                                ),
+                                package=pkg.name,
+                                ecosystem="npm",
+                            ))
+
     return findings
 
 
 # ─── 5. Quarantine / Removal Check ──────────────────────────────────────────
 
-def check_package_exists(pkg: PackageRef) -> list[Finding]:
+def check_package_exists(pkg: PackageRef, cache: MetadataCache) -> list[Finding]:
     """Check if the package has been removed or quarantined."""
     findings = []
 
     if pkg.ecosystem == "pypi":
-        try:
-            ctx = ssl.create_default_context()
-            req = urllib.request.Request(
-                f"https://pypi.org/pypi/{pkg.name}/json",
-                headers={"User-Agent": "sec-check/1.0"},
-            )
-            urllib.request.urlopen(req, timeout=10, context=ctx)
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                findings.append(Finding(
-                    severity="critical",
-                    check_name="package_removed",
-                    title=f"Package '{pkg.name}' not found on PyPI",
-                    detail=(
-                        f"'{pkg.name}' returned 404 on PyPI. The package may have been "
-                        f"removed or quarantined due to a security incident. "
-                        f"DO NOT install this package."
-                    ),
-                    package=pkg.name,
-                    ecosystem="pypi",
-                ))
-        except Exception:
-            pass
+        result = cache.get_pypi(pkg.name)
+        if result.status_code == 404:
+            findings.append(Finding(
+                severity="critical",
+                check_name="package_removed",
+                title=f"Package '{pkg.name}' not found on PyPI",
+                detail=(
+                    f"'{pkg.name}' returned 404 on PyPI. The package may have been "
+                    f"removed or quarantined due to a security incident. "
+                    f"DO NOT install this package."
+                ),
+                package=pkg.name,
+                ecosystem="pypi",
+            ))
 
     elif pkg.ecosystem == "npm":
-        try:
-            ctx = ssl.create_default_context()
-            req = urllib.request.Request(
-                f"https://registry.npmjs.org/{pkg.name}",
-                headers={"User-Agent": "sec-check/1.0"},
-            )
-            urllib.request.urlopen(req, timeout=10, context=ctx)
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                findings.append(Finding(
-                    severity="critical",
-                    check_name="package_removed",
-                    title=f"Package '{pkg.name}' not found on npm",
-                    detail=f"'{pkg.name}' returned 404 on npm. It may have been removed due to a security incident.",
-                    package=pkg.name,
-                    ecosystem="npm",
-                ))
-        except Exception:
-            pass
+        result = cache.get_npm(pkg.name)
+        if result.status_code == 404:
+            findings.append(Finding(
+                severity="critical",
+                check_name="package_removed",
+                title=f"Package '{pkg.name}' not found on npm",
+                detail=f"'{pkg.name}' returned 404 on npm. It may have been removed due to a security incident.",
+                package=pkg.name,
+                ecosystem="npm",
+            ))
 
     return findings
 
@@ -538,6 +741,7 @@ def check_package_exists(pkg: PackageRef) -> list[Finding]:
 # ─── Master runner ───────────────────────────────────────────────────────────
 
 ALL_CHECKERS = [
+    check_suspicious_install,
     check_package_exists,
     check_known_vulnerabilities,
     check_typosquatting,
@@ -546,13 +750,33 @@ ALL_CHECKERS = [
 ]
 
 
-def run_all_checks(pkg: PackageRef) -> list[Finding]:
+def run_all_checks(pkg: PackageRef, disk_cache=None) -> CheckResult:
     """Run all security checks on a single package."""
+    cache = MetadataCache(disk_cache=disk_cache)
     findings = []
+    failed = 0
+    errors = []
+
+    # Short-circuit for synthetic package names (dynamic/piped installs)
+    if pkg.name.startswith("__") and pkg.name.endswith("__"):
+        try:
+            findings.extend(check_suspicious_install(pkg, cache))
+        except Exception as e:
+            failed += 1
+            errors.append(f"check_suspicious_install: {e}")
+        return CheckResult(
+            findings=findings,
+            total_checkers=1,
+            failed_checkers=failed,
+            checker_errors=errors,
+        )
+
     for checker in ALL_CHECKERS:
         try:
-            findings.extend(checker(pkg))
+            findings.extend(checker(pkg, cache))
         except Exception as e:
+            failed += 1
+            errors.append(f"{checker.__name__}: {e}")
             findings.append(Finding(
                 severity="info",
                 check_name="checker_error",
@@ -561,4 +785,10 @@ def run_all_checks(pkg: PackageRef) -> list[Finding]:
                 package=pkg.name,
                 ecosystem=pkg.ecosystem,
             ))
-    return findings
+
+    return CheckResult(
+        findings=findings,
+        total_checkers=len(ALL_CHECKERS),
+        failed_checkers=failed,
+        checker_errors=errors,
+    )
