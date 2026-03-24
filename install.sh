@@ -72,13 +72,19 @@ else
 fi
 
 # 7. Merge hook config using Python (works everywhere)
-python3 << PYEOF
+# NOTE: Using quoted heredoc ('PYEOF') to prevent shell injection.
+# Variables are passed via environment, not string interpolation.
+SETTINGS_FILE="$SETTINGS_FILE" \
+HOOK_CMD="$HOOK_CMD" \
+SEC_CHECK_DIR="$SEC_CHECK_DIR" \
+python3 << 'PYEOF'
 import json
+import os
 import sys
 
-settings_file = "$SETTINGS_FILE"
-hook_cmd = "$HOOK_CMD"
-sec_check_dir = "$SEC_CHECK_DIR"
+settings_file = os.environ["SETTINGS_FILE"]
+hook_cmd = os.environ["HOOK_CMD"]
+sec_check_dir = os.environ["SEC_CHECK_DIR"]
 
 try:
     with open(settings_file, 'r') as f:
@@ -107,7 +113,6 @@ if already_installed:
     sys.exit(0)
 
 # We need PYTHONPATH so the module can be found
-# The hook command sets this via env
 full_cmd = f"PYTHONPATH={sec_check_dir}/.. python3 -m sec_check.hook"
 
 # Add the hook

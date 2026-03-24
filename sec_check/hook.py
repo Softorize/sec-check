@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sec_check.parsers import parse_command
-from sec_check.checkers import run_all_checks, Finding
+from sec_check.checkers import run_all_checks, Finding, CheckResult
 
 
 # ─── Severity colors for terminal output ─────────────────────────────────────
@@ -104,12 +104,25 @@ def format_report(findings: list[Finding], packages: list) -> str:
 
 
 def main():
+    # Optional: run disk cache cleanup
+    try:
+        from sec_check.cache import DiskCache
+        DiskCache().cleanup()
+        disk_cache = DiskCache()
+    except ImportError:
+        disk_cache = None
+    except Exception:
+        disk_cache = None
+
     # Read hook input from stdin
     try:
         raw = sys.stdin.read()
         hook_input = json.loads(raw)
-    except (json.JSONDecodeError, Exception) as e:
-        # Can't parse input — allow (don't break the agent)
+    except json.JSONDecodeError:
+        sys.stderr.write("sec-check: WARNING: Could not parse hook input JSON.\n")
+        sys.exit(0)
+    except Exception as e:
+        sys.stderr.write(f"sec-check: WARNING: Unexpected error reading input: {e}\n")
         sys.exit(0)
 
     tool_name = hook_input.get("tool_name", "")
@@ -131,14 +144,41 @@ def main():
 
     # Run checks in parallel across packages
     all_findings: list[Finding] = []
+    total_checkers_run = 0
+    total_checkers_failed = 0
+    all_checker_errors: list[str] = []
+    futures_failed = 0
 
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(run_all_checks, pkg): pkg for pkg in packages}
+        futures = {pool.submit(run_all_checks, pkg, disk_cache): pkg for pkg in packages}
         for future in as_completed(futures):
+            pkg = futures[future]
             try:
-                all_findings.extend(future.result())
-            except Exception:
-                pass
+                result: CheckResult = future.result()
+                all_findings.extend(result.findings)
+                total_checkers_run += result.total_checkers
+                total_checkers_failed += result.failed_checkers
+                all_checker_errors.extend(result.checker_errors)
+            except Exception as e:
+                futures_failed += 1
+                sys.stderr.write(f"sec-check: WARNING: All checks failed for {pkg.name}: {e}\n")
+
+    # If ALL futures raised exceptions, block
+    if futures_failed == len(packages):
+        sys.stderr.write(
+            "\nsec-check: BLOCKED - could not run any security checks.\n"
+            "All check executions raised exceptions.\n"
+        )
+        sys.exit(2)
+
+    # If ALL individual checkers failed, block
+    if total_checkers_run > 0 and total_checkers_failed == total_checkers_run:
+        sys.stderr.write(
+            "\nsec-check: BLOCKED - all security checkers failed.\n"
+            "Cannot verify package safety. Possible network issue.\n"
+            f"Errors: {'; '.join(all_checker_errors[:5])}\n"
+        )
+        sys.exit(2)
 
     if not all_findings:
         # All clear
